@@ -4,11 +4,10 @@ import { z } from 'zod';
 import { postJournal, trialBalance, financialSummary } from './accounting.js';
 import { complianceSummary } from './compliance.js';
 import { part2Routes } from './part2-routes.js';
-
-const app=express(); app.use(express.json({limit:'5mb'}));
+import { part3Routes } from './part3-routes.js';
+const app=express();app.use(express.json({limit:'10mb'}));
 const pool=new Pool({connectionString:process.env.DATABASE_URL??'postgres://ai_tax:ai_tax_dev@localhost:5432/ai_tax'});
-const ORG='00000000-0000-0000-0000-000000000001'; const PERIOD='00000000-0000-0000-0000-000000000101';
-const money=z.number().finite().nonnegative();
+const ORG='00000000-0000-0000-0000-000000000001';const PERIOD='00000000-0000-0000-0000-000000000101';const money=z.number().finite().nonnegative();
 app.get('/api/health',async(_req,res)=>{try{await pool.query('SELECT 1');res.json({ok:true,database:true,service:'ai-tax-api'})}catch{res.status(503).json({ok:false,database:false})}});
 app.get('/api/dashboard',async(_req,res)=>{try{const [org,tb,summary,exceptions]=await Promise.all([pool.query('SELECT id,name,legal_name,pan,gstin,entity_type,state_code FROM organizations WHERE id=$1',[ORG]),trialBalance(pool,ORG),financialSummary(pool,ORG),pool.query("SELECT severity,title,description,status FROM exceptions WHERE organization_id=$1 AND status='OPEN' ORDER BY created_at DESC LIMIT 10",[ORG])]);const totals=tb.reduce((a,r)=>({debit:a.debit+Number(r.debit),credit:a.credit+Number(r.credit)}),{debit:0,credit:0});res.json({organization:org.rows[0],trialBalance:tb,summary,totals,exceptions:exceptions.rows})}catch(e){res.status(500).json({error:e instanceof Error?e.message:'Dashboard failed'})}});
 app.get('/api/accounts',async(_req,res)=>res.json((await pool.query('SELECT id,code,name,type,parent_id FROM accounts WHERE organization_id=$1 ORDER BY code',[ORG])).rows));
@@ -26,4 +25,5 @@ app.get('/api/invoices/:id',async(req,res)=>{const i=await pool.query('SELECT i.
 app.get('/api/ledger/:accountId',async(req,res)=>{const r=await pool.query(`SELECT je.entry_date,je.voucher_number,je.voucher_type,je.narration,jl.description,jl.debit,jl.credit FROM journal_lines jl JOIN journal_entries je ON je.id=jl.journal_id WHERE je.organization_id=$1 AND jl.account_id=$2 AND je.status='POSTED' ORDER BY je.entry_date,je.created_at`,[ORG,req.params.accountId]);let b=0;res.json(r.rows.map(x=>{b+=Number(x.debit)-Number(x.credit);return {...x,balance:b.toFixed(2)}}))});
 app.get('/api/reports/summary',async(_req,res)=>res.json(await financialSummary(pool,ORG)));app.get('/api/reports/trial-balance',async(_req,res)=>res.json(await trialBalance(pool,ORG)));app.get('/api/compliance/summary',async(_req,res)=>res.json(await complianceSummary(pool,ORG)));
 app.use('/api/part2',part2Routes(pool,ORG));
+app.use('/api/part3',part3Routes(pool,ORG));
 app.get('/',(_req,res)=>res.sendFile('index.html',{root:'public'}));app.use(express.static('public'));const port=Number(process.env.PORT??3000);app.listen(port,()=>console.log(`AI TAX running on http://localhost:${port}`));
