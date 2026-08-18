@@ -5,6 +5,7 @@ import { postJournal, trialBalance, financialSummary } from './accounting.js';
 import { complianceSummary } from './compliance.js';
 import { part2Routes } from './part2-routes.js';
 import { part3Routes } from './part3-routes.js';
+import { part5Routes } from './part5-routes.js';
 const app=express();app.use(express.json({limit:'10mb'}));
 const pool=new Pool({connectionString:process.env.DATABASE_URL??'postgres://ai_tax:ai_tax_dev@localhost:5432/ai_tax'});
 const ORG='00000000-0000-0000-0000-000000000001';const PERIOD='00000000-0000-0000-0000-000000000101';const money=z.number().finite().nonnegative();
@@ -26,4 +27,5 @@ app.get('/api/ledger/:accountId',async(req,res)=>{const r=await pool.query(`SELE
 app.get('/api/reports/summary',async(_req,res)=>res.json(await financialSummary(pool,ORG)));app.get('/api/reports/trial-balance',async(_req,res)=>res.json(await trialBalance(pool,ORG)));app.get('/api/compliance/summary',async(_req,res)=>res.json(await complianceSummary(pool,ORG)));
 app.use('/api/part2',part2Routes(pool,ORG));
 app.use('/api/part3',part3Routes(pool,ORG));
+app.use('/api/part5',part5Routes());
 app.get('/',(_req,res)=>res.sendFile('index.html',{root:'public'}));app.use(express.static('public'));const port=Number(process.env.PORT??3000);app.listen(port,()=>console.log(`AI TAX running on http://localhost:${port}`));
