@@ -1,12 +1,14 @@
 {
   "name": "ai-tax",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
-  "description": "AI-first Indian accounting, GST, TDS and ITR compliance platform",
+  "description": "AI-first Indian accounting, GST, TDS and ITR compliance SaaS",
   "type": "module",
   "scripts": {
-    "dev": "tsx src/server.ts",
-    "start": "node dist/server.js",
+    "dev": "tsx src/production-server.ts",
+    "dev:legacy": "tsx src/server.ts",
+    "start": "node dist/src/production-server.js",
+    "start:legacy": "node dist/src/server.js",
     "build": "tsc",
     "test": "tsx --test test/**/*.test.ts"
   },
