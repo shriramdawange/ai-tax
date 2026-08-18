@@ -1,0 +1,135 @@
+import { createHash, randomBytes, scrypt as scryptCb, timingSafeEqual } from 'node:crypto';
+import { promisify } from 'node:util';
+import { Router, Request, Response, NextFunction } from 'express';
+import { Pool } from 'pg';
+import { z } from 'zod';
+
+const scrypt = promisify(scryptCb);
+const SESSION_DAYS = 14;
+const emailSchema = z.string().trim().email().max(320).transform(v => v.toLowerCase());
+const gstinSchema = z.string().trim().toUpperCase().regex(/^[0-9A-Z]{15}$/);
+
+function hashToken(token: string) { return createHash('sha256').update(token).digest('hex'); }
+async function hashPassword(password: string) {
+  if (password.length < 10) throw new Error('Password must contain at least 10 characters');
+  const salt = randomBytes(16).toString('hex');
+  const derived = await scrypt(password, salt, 64) as Buffer;
+  return `scrypt$${salt}$${derived.toString('hex')}`;
+}
+async function verifyPassword(password: string, encoded: string) {
+  const [, salt, expectedHex] = encoded.split('$');
+  if (!salt || !expectedHex) return false;
+  const actual = await scrypt(password, salt, 64) as Buffer;
+  const expected = Buffer.from(expectedHex, 'hex');
+  return expected.length === actual.length && timingSafeEqual(actual, expected);
+}
+
+export type AuthContext = { userId: string; organizationId: string; role: string; email: string };
+
+declare global { namespace Express { interface Request { auth?: AuthContext } } }
+
+export function authRequired(pool: Pool) {
+  return async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const header = req.header('authorization');
+      if (!header?.startsWith('Bearer ')) return res.status(401).json({ error: 'Authentication required' });
+      const token = header.slice(7).trim();
+      const result = await pool.query(`SELECT s.user_id,u.email,m.organization_id,m.role
+        FROM sessions s JOIN app_users u ON u.id=s.user_id
+        JOIN memberships m ON m.user_id=u.id
+        WHERE s.token_hash=$1 AND s.expires_at>now() AND u.disabled_at IS NULL LIMIT 1`, [hashToken(token)]);
+      if (!result.rowCount) return res.status(401).json({ error: 'Session expired or invalid' });
+      const row = result.rows[0];
+      const requestedTenant = req.header('x-tenant-id');
+      if (requestedTenant && requestedTenant !== row.organization_id) return res.status(403).json({ error: 'Tenant access denied' });
+      req.auth = { userId: row.user_id, organizationId: row.organization_id, role: row.role, email: row.email };
+      next();
+    } catch (error) { next(error); }
+  };
+}
+
+export function saasRoutes(pool: Pool) {
+  const r = Router();
+  r.post('/auth/register', async (req, res) => {
+    try {
+      const body = z.object({ email: emailSchema, password: z.string(), displayName: z.string().trim().min(2).max(120), businessName: z.string().trim().min(2).max(200), legalName: z.string().trim().max(200).optional(), gstin: gstinSchema.optional(), pan: z.string().trim().toUpperCase().max(10).optional(), stateCode: z.string().regex(/^\d{2}$/).optional(), entityType: z.string().default('proprietorship') }).parse(req.body);
+      const passwordHash = await hashPassword(body.password);
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const user = await client.query(`INSERT INTO app_users(email,password_hash,display_name) VALUES($1,$2,$3) RETURNING id,email,display_name`, [body.email, passwordHash, body.displayName]);
+        const org = await client.query(`INSERT INTO organizations(name,legal_name,pan,gstin,state_code,entity_type) VALUES($1,$2,$3,$4,$5,$6) RETURNING id,name,legal_name,pan,gstin,state_code,entity_type`, [body.businessName, body.legalName ?? body.businessName, body.pan ?? null, body.gstin ?? null, body.stateCode ?? null, body.entityType]);
+        await client.query(`INSERT INTO memberships(user_id,organization_id,role) VALUES($1,$2,'OWNER')`, [user.rows[0].id, org.rows[0].id]);
+        await client.query(`INSERT INTO automation_policies(organization_id) VALUES($1)`, [org.rows[0].id]);
+        const periodStart = new Date().getMonth() >= 3 ? `${new Date().getFullYear()}-04-01` : `${new Date().getFullYear()-1}-04-01`;
+        const year = Number(periodStart.slice(0,4));
+        await client.query(`INSERT INTO financial_periods(organization_id,name,starts_on,ends_on) VALUES($1,$2,$3,$4)`, [org.rows[0].id, `FY ${year}-${String((year+1)%100).padStart(2,'0')}`, periodStart, `${year+1}-03-31`]);
+        const token = randomBytes(32).toString('base64url');
+        await client.query(`INSERT INTO sessions(user_id,token_hash,expires_at) VALUES($1,$2,now()+interval '${SESSION_DAYS} days')`, [user.rows[0].id, hashToken(token)]);
+        await client.query('COMMIT');
+        res.status(201).json({ token, user: user.rows[0], organization: org.rows[0] });
+      } catch (error) { await client.query('ROLLBACK'); throw error; } finally { client.release(); }
+    } catch (error) { res.status(400).json({ error: error instanceof Error ? error.message : 'Registration failed' }); }
+  });
+
+  r.post('/auth/login', async (req, res) => {
+    try {
+      const body = z.object({ email: emailSchema, password: z.string() }).parse(req.body);
+      const user = await pool.query('SELECT id,email,display_name,password_hash FROM app_users WHERE email=$1 AND disabled_at IS NULL', [body.email]);
+      if (!user.rowCount || !(await verifyPassword(body.password, user.rows[0].password_hash))) return res.status(401).json({ error: 'Invalid credentials' });
+      const membership = await pool.query(`SELECT m.organization_id,m.role,o.name,o.legal_name,o.gstin,o.pan,o.state_code,o.entity_type
+        FROM memberships m JOIN organizations o ON o.id=m.organization_id WHERE m.user_id=$1 ORDER BY m.created_at LIMIT 1`, [user.rows[0].id]);
+      if (!membership.rowCount) return res.status(403).json({ error: 'No organization membership' });
+      const token = randomBytes(32).toString('base64url');
+      await pool.query(`INSERT INTO sessions(user_id,token_hash,expires_at) VALUES($1,$2,now()+interval '${SESSION_DAYS} days')`, [user.rows[0].id, hashToken(token)]);
+      res.json({ token, user: { id:user.rows[0].id,email:user.rows[0].email,displayName:user.rows[0].display_name }, organization: membership.rows[0] });
+    } catch (error) { res.status(400).json({ error: error instanceof Error ? error.message : 'Login failed' }); }
+  });
+
+  r.post('/auth/logout', authRequired(pool), async (req, res) => {
+    const token = req.header('authorization')!.slice(7).trim();
+    await pool.query('DELETE FROM sessions WHERE token_hash=$1', [hashToken(token)]);
+    res.json({ ok:true });
+  });
+
+  r.get('/me', authRequired(pool), async (req,res) => {
+    const a=req.auth!;
+    const [org,policy]=await Promise.all([
+      pool.query('SELECT id,name,legal_name,pan,gstin,state_code,entity_type FROM organizations WHERE id=$1',[a.organizationId]),
+      pool.query('SELECT level,auto_post_low_risk,auto_reconcile,auto_prepare_returns,filing_requires_authorization FROM automation_policies WHERE organization_id=$1',[a.organizationId])
+    ]);
+    res.json({user:{id:a.userId,email:a.email,role:a.role},organization:org.rows[0],automationPolicy:policy.rows[0]});
+  });
+
+  r.patch('/automation-policy', authRequired(pool), async (req,res) => {
+    if (!['OWNER','ADMIN'].includes(req.auth!.role)) return res.status(403).json({error:'Admin permission required'});
+    const body=z.object({level:z.number().int().min(0).max(4),autoPostLowRisk:z.boolean(),autoReconcile:z.boolean(),autoPrepareReturns:z.boolean(),filingRequiresAuthorization:z.boolean()}).parse(req.body);
+    const row=await pool.query(`UPDATE automation_policies SET level=$2,auto_post_low_risk=$3,auto_reconcile=$4,auto_prepare_returns=$5,filing_requires_authorization=$6,updated_at=now() WHERE organization_id=$1 RETURNING *`,[req.auth!.organizationId,body.level,body.autoPostLowRisk,body.autoReconcile,body.autoPrepareReturns,body.filingRequiresAuthorization]);
+    res.json(row.rows[0]);
+  });
+
+  r.post('/business/government-connection', authRequired(pool), async(req,res)=>{
+    if(!['OWNER','ADMIN'].includes(req.auth!.role)) return res.status(403).json({error:'Admin permission required'});
+    const body=z.object({provider:z.string().min(2).max(80),connectionType:z.string().min(2).max(80),status:z.enum(['NOT_CONNECTED','PENDING_CONSENT','CONNECTED','EXPIRED','ERROR']).default('PENDING_CONSENT'),externalSubject:z.string().max(200).optional(),metadata:z.record(z.string(),z.unknown()).default({})}).parse(req.body);
+    const row=await pool.query(`INSERT INTO government_connections(organization_id,provider,connection_type,status,external_subject,metadata,updated_at) VALUES($1,$2,$3,$4,$5,$6,now()) ON CONFLICT(organization_id,provider,connection_type) DO UPDATE SET status=EXCLUDED.status,external_subject=EXCLUDED.external_subject,metadata=EXCLUDED.metadata,updated_at=now() RETURNING id,provider,connection_type,status,external_subject,metadata,updated_at`,[req.auth!.organizationId,body.provider,body.connectionType,body.status,body.externalSubject??null,JSON.stringify(body.metadata)]);
+    res.status(201).json(row.rows[0]);
+  });
+
+  r.get('/business/government-connections',authRequired(pool),async(req,res)=>res.json((await pool.query(`SELECT id,provider,connection_type,status,external_subject,metadata,updated_at FROM government_connections WHERE organization_id=$1 ORDER BY provider,connection_type`,[req.auth!.organizationId])).rows));
+  return r;
+}
+
+export async function emitEvent(pool:Pool,organizationId:string,eventType:string,payload:unknown){
+  const row=await pool.query(`INSERT INTO realtime_events(organization_id,event_type,payload) VALUES($1,$2,$3) RETURNING id,created_at`,[organizationId,eventType,JSON.stringify(payload)]);
+  return row.rows[0];
+}
+
+export function realtimeRoute(pool:Pool){
+  return async(req:Request,res:Response)=>{
+    if(!req.auth)return res.status(401).end();
+    res.status(200);res.setHeader('Content-Type','text/event-stream');res.setHeader('Cache-Control','no-cache');res.setHeader('Connection','keep-alive');res.flushHeaders?.();
+    let cursor=Number(req.query.after??0)||0; let alive=true;
+    const send=async()=>{if(!alive)return;const rows=await pool.query(`SELECT id,event_type,payload,created_at FROM realtime_events WHERE organization_id=$1 AND id>$2 ORDER BY id LIMIT 50`,[req.auth!.organizationId,cursor]);for(const row of rows.rows){cursor=Number(row.id);res.write(`id: ${row.id}\nevent: ${row.event_type}\ndata: ${JSON.stringify(row.payload)}\n\n`);}};
+    await send(); const timer=setInterval(()=>void send().catch(()=>{}),1500);req.on('close',()=>{alive=false;clearInterval(timer);});
+  };
+}
