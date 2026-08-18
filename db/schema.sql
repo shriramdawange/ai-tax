@@ -1,185 +1,25 @@
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
-CREATE TABLE organizations (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  name TEXT NOT NULL,
-  legal_name TEXT,
-  pan TEXT,
-  gstin TEXT,
-  state_code CHAR(2),
-  entity_type TEXT NOT NULL DEFAULT 'proprietorship',
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
+CREATE TABLE organizations (id UUID PRIMARY KEY DEFAULT gen_random_uuid(),name TEXT NOT NULL,legal_name TEXT,pan TEXT,gstin TEXT,state_code CHAR(2),entity_type TEXT NOT NULL DEFAULT 'proprietorship',created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+CREATE TABLE financial_periods (id UUID PRIMARY KEY DEFAULT gen_random_uuid(),organization_id UUID NOT NULL REFERENCES organizations(id),name TEXT NOT NULL,starts_on DATE NOT NULL,ends_on DATE NOT NULL,status TEXT NOT NULL DEFAULT 'OPEN' CHECK(status IN('OPEN','REVIEW','LOCKED','CLOSED')),UNIQUE(organization_id,starts_on,ends_on),CHECK(starts_on<=ends_on));
+CREATE TABLE accounts (id UUID PRIMARY KEY DEFAULT gen_random_uuid(),organization_id UUID NOT NULL REFERENCES organizations(id),code TEXT NOT NULL,name TEXT NOT NULL,type TEXT NOT NULL CHECK(type IN('ASSET','LIABILITY','EQUITY','INCOME','EXPENSE')),parent_id UUID REFERENCES accounts(id),is_system BOOLEAN NOT NULL DEFAULT false,UNIQUE(organization_id,code));
+CREATE TABLE parties (id UUID PRIMARY KEY DEFAULT gen_random_uuid(),organization_id UUID NOT NULL REFERENCES organizations(id),name TEXT NOT NULL,kind TEXT NOT NULL CHECK(kind IN('CUSTOMER','VENDOR','BOTH')),gstin TEXT,pan TEXT,state_code CHAR(2),created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+CREATE TABLE bank_accounts (id UUID PRIMARY KEY DEFAULT gen_random_uuid(),organization_id UUID NOT NULL REFERENCES organizations(id),name TEXT NOT NULL,account_number_last4 CHAR(4),opening_balance NUMERIC(18,2) NOT NULL DEFAULT 0 CHECK(opening_balance>=0));
+CREATE TABLE invoices (id UUID PRIMARY KEY DEFAULT gen_random_uuid(),organization_id UUID NOT NULL REFERENCES organizations(id),invoice_number TEXT NOT NULL,invoice_date DATE NOT NULL,document_type TEXT NOT NULL CHECK(document_type IN('SALES','PURCHASE','CREDIT_NOTE','DEBIT_NOTE')),party_id UUID REFERENCES parties(id),taxable_value NUMERIC(18,2) NOT NULL DEFAULT 0 CHECK(taxable_value>=0),cgst NUMERIC(18,2) NOT NULL DEFAULT 0 CHECK(cgst>=0),sgst NUMERIC(18,2) NOT NULL DEFAULT 0 CHECK(sgst>=0),igst NUMERIC(18,2) NOT NULL DEFAULT 0 CHECK(igst>=0),cess NUMERIC(18,2) NOT NULL DEFAULT 0 CHECK(cess>=0),total NUMERIC(18,2) NOT NULL DEFAULT 0 CHECK(total>=0),place_of_supply CHAR(2),reverse_charge BOOLEAN NOT NULL DEFAULT false,status TEXT NOT NULL DEFAULT 'DRAFT' CHECK(status IN('DRAFT','VALIDATED','POSTED','VOID')),created_at TIMESTAMPTZ NOT NULL DEFAULT now(),UNIQUE(organization_id,invoice_number,document_type));
+CREATE TABLE invoice_items (id UUID PRIMARY KEY DEFAULT gen_random_uuid(),invoice_id UUID NOT NULL REFERENCES invoices(id) ON DELETE CASCADE,description TEXT NOT NULL,hsn_sac TEXT,quantity NUMERIC(18,3) NOT NULL DEFAULT 1 CHECK(quantity>0),unit_price NUMERIC(18,2) NOT NULL CHECK(unit_price>=0),taxable_value NUMERIC(18,2) NOT NULL CHECK(taxable_value>=0),gst_rate NUMERIC(6,3) NOT NULL DEFAULT 0 CHECK(gst_rate>=0),cgst NUMERIC(18,2) NOT NULL DEFAULT 0,sgst NUMERIC(18,2) NOT NULL DEFAULT 0,igst NUMERIC(18,2) NOT NULL DEFAULT 0,cess NUMERIC(18,2) NOT NULL DEFAULT 0,total NUMERIC(18,2) NOT NULL DEFAULT 0);
+CREATE TABLE bank_transactions (id UUID PRIMARY KEY DEFAULT gen_random_uuid(),organization_id UUID NOT NULL REFERENCES organizations(id),bank_account_id UUID NOT NULL REFERENCES bank_accounts(id),transaction_date DATE NOT NULL,value_date DATE,narration TEXT NOT NULL,reference TEXT,debit NUMERIC(18,2) NOT NULL DEFAULT 0 CHECK(debit>=0),credit NUMERIC(18,2) NOT NULL DEFAULT 0 CHECK(credit>=0),balance NUMERIC(18,2),source_hash TEXT NOT NULL,matched_journal_id UUID,CHECK(NOT(debit>0 AND credit>0)),UNIQUE(organization_id,source_hash));
+CREATE TABLE journal_entries (id UUID PRIMARY KEY DEFAULT gen_random_uuid(),organization_id UUID NOT NULL REFERENCES organizations(id),financial_period_id UUID NOT NULL REFERENCES financial_periods(id),voucher_number TEXT NOT NULL,voucher_type TEXT NOT NULL,entry_date DATE NOT NULL,narration TEXT NOT NULL,source_type TEXT,source_id UUID,status TEXT NOT NULL DEFAULT 'POSTED' CHECK(status IN('DRAFT','POSTED','REVERSED')),created_at TIMESTAMPTZ NOT NULL DEFAULT now(),UNIQUE(organization_id,voucher_number));
+CREATE TABLE journal_lines (id UUID PRIMARY KEY DEFAULT gen_random_uuid(),journal_id UUID NOT NULL REFERENCES journal_entries(id) ON DELETE CASCADE,account_id UUID NOT NULL REFERENCES accounts(id),party_id UUID REFERENCES parties(id),description TEXT,debit NUMERIC(18,2) NOT NULL DEFAULT 0 CHECK(debit>=0),credit NUMERIC(18,2) NOT NULL DEFAULT 0 CHECK(credit>=0),CHECK((debit>0 AND credit=0) OR (credit>0 AND debit=0)));
+CREATE TABLE gst_transactions (id UUID PRIMARY KEY DEFAULT gen_random_uuid(),organization_id UUID NOT NULL REFERENCES organizations(id),invoice_id UUID REFERENCES invoices(id),direction TEXT NOT NULL CHECK(direction IN('OUTPUT','INPUT')),supply_category TEXT NOT NULL DEFAULT 'B2B',taxable_value NUMERIC(18,2) NOT NULL DEFAULT 0,cgst NUMERIC(18,2) NOT NULL DEFAULT 0,sgst NUMERIC(18,2) NOT NULL DEFAULT 0,igst NUMERIC(18,2) NOT NULL DEFAULT 0,cess NUMERIC(18,2) NOT NULL DEFAULT 0,itc_status TEXT,reverse_charge BOOLEAN NOT NULL DEFAULT false,created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+CREATE TABLE tds_transactions (id UUID PRIMARY KEY DEFAULT gen_random_uuid(),organization_id UUID NOT NULL REFERENCES organizations(id),party_id UUID REFERENCES parties(id),transaction_date DATE NOT NULL,section_code TEXT,base_amount NUMERIC(18,2) NOT NULL CHECK(base_amount>=0),rate NUMERIC(8,4) NOT NULL DEFAULT 0 CHECK(rate>=0),tds_amount NUMERIC(18,2) NOT NULL DEFAULT 0 CHECK(tds_amount>=0),status TEXT NOT NULL DEFAULT 'PROPOSED');
+CREATE TABLE compliance_items (id UUID PRIMARY KEY DEFAULT gen_random_uuid(),organization_id UUID NOT NULL REFERENCES organizations(id),compliance_type TEXT NOT NULL CHECK(compliance_type IN('GSTR1','GSTR3B','TDS','ITR')),period_start DATE NOT NULL,period_end DATE NOT NULL,status TEXT NOT NULL DEFAULT 'DRAFT',payload JSONB,acknowledgement JSONB,created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+CREATE TABLE exceptions (id UUID PRIMARY KEY DEFAULT gen_random_uuid(),organization_id UUID NOT NULL REFERENCES organizations(id),severity TEXT NOT NULL CHECK(severity IN('LOW','MEDIUM','HIGH','CRITICAL')),category TEXT NOT NULL,title TEXT NOT NULL,description TEXT NOT NULL,source_type TEXT,source_id UUID,status TEXT NOT NULL DEFAULT 'OPEN' CHECK(status IN('OPEN','RESOLVED','IGNORED')),created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+CREATE TABLE audit_logs (id UUID PRIMARY KEY DEFAULT gen_random_uuid(),organization_id UUID NOT NULL REFERENCES organizations(id),actor_type TEXT NOT NULL,action TEXT NOT NULL,entity_type TEXT,entity_id UUID,before_data JSONB,after_data JSONB,created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+CREATE INDEX idx_journal_org_date ON journal_entries(organization_id,entry_date);CREATE INDEX idx_journal_lines_account ON journal_lines(account_id);CREATE INDEX idx_bank_org_date ON bank_transactions(organization_id,transaction_date);CREATE INDEX idx_gst_org ON gst_transactions(organization_id);CREATE INDEX idx_invoice_org_date ON invoices(organization_id,invoice_date);CREATE INDEX idx_exceptions_org_status ON exceptions(organization_id,status);
 
-CREATE TABLE financial_periods (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  organization_id UUID NOT NULL REFERENCES organizations(id),
-  name TEXT NOT NULL,
-  starts_on DATE NOT NULL,
-  ends_on DATE NOT NULL,
-  status TEXT NOT NULL DEFAULT 'OPEN' CHECK (status IN ('OPEN','REVIEW','LOCKED','CLOSED')),
-  UNIQUE (organization_id, starts_on, ends_on)
-);
-
-CREATE TABLE accounts (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  organization_id UUID NOT NULL REFERENCES organizations(id),
-  code TEXT NOT NULL,
-  name TEXT NOT NULL,
-  type TEXT NOT NULL CHECK (type IN ('ASSET','LIABILITY','EQUITY','INCOME','EXPENSE')),
-  parent_id UUID REFERENCES accounts(id),
-  is_system BOOLEAN NOT NULL DEFAULT false,
-  UNIQUE (organization_id, code)
-);
-
-CREATE TABLE parties (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  organization_id UUID NOT NULL REFERENCES organizations(id),
-  name TEXT NOT NULL,
-  kind TEXT NOT NULL CHECK (kind IN ('CUSTOMER','VENDOR','BOTH')),
-  gstin TEXT,
-  pan TEXT,
-  state_code CHAR(2),
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE TABLE bank_accounts (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  organization_id UUID NOT NULL REFERENCES organizations(id),
-  name TEXT NOT NULL,
-  account_number_last4 CHAR(4),
-  opening_balance NUMERIC(18,2) NOT NULL DEFAULT 0
-);
-
-CREATE TABLE invoices (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  organization_id UUID NOT NULL REFERENCES organizations(id),
-  invoice_number TEXT NOT NULL,
-  invoice_date DATE NOT NULL,
-  document_type TEXT NOT NULL CHECK (document_type IN ('SALES','PURCHASE','CREDIT_NOTE','DEBIT_NOTE')),
-  party_id UUID REFERENCES parties(id),
-  taxable_value NUMERIC(18,2) NOT NULL DEFAULT 0,
-  cgst NUMERIC(18,2) NOT NULL DEFAULT 0,
-  sgst NUMERIC(18,2) NOT NULL DEFAULT 0,
-  igst NUMERIC(18,2) NOT NULL DEFAULT 0,
-  cess NUMERIC(18,2) NOT NULL DEFAULT 0,
-  total NUMERIC(18,2) NOT NULL DEFAULT 0,
-  place_of_supply CHAR(2),
-  reverse_charge BOOLEAN NOT NULL DEFAULT false,
-  status TEXT NOT NULL DEFAULT 'DRAFT',
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  UNIQUE (organization_id, invoice_number, document_type)
-);
-
-CREATE TABLE bank_transactions (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  organization_id UUID NOT NULL REFERENCES organizations(id),
-  bank_account_id UUID NOT NULL REFERENCES bank_accounts(id),
-  transaction_date DATE NOT NULL,
-  value_date DATE,
-  narration TEXT NOT NULL,
-  reference TEXT,
-  debit NUMERIC(18,2) NOT NULL DEFAULT 0,
-  credit NUMERIC(18,2) NOT NULL DEFAULT 0,
-  balance NUMERIC(18,2),
-  source_hash TEXT NOT NULL,
-  matched_journal_id UUID,
-  UNIQUE (organization_id, source_hash)
-);
-
-CREATE TABLE journal_entries (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  organization_id UUID NOT NULL REFERENCES organizations(id),
-  financial_period_id UUID NOT NULL REFERENCES financial_periods(id),
-  voucher_number TEXT NOT NULL,
-  voucher_type TEXT NOT NULL,
-  entry_date DATE NOT NULL,
-  narration TEXT NOT NULL,
-  source_type TEXT,
-  source_id UUID,
-  status TEXT NOT NULL DEFAULT 'POSTED' CHECK (status IN ('DRAFT','POSTED','REVERSED')),
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  UNIQUE (organization_id, voucher_number)
-);
-
-CREATE TABLE journal_lines (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  journal_id UUID NOT NULL REFERENCES journal_entries(id) ON DELETE CASCADE,
-  account_id UUID NOT NULL REFERENCES accounts(id),
-  party_id UUID REFERENCES parties(id),
-  description TEXT,
-  debit NUMERIC(18,2) NOT NULL DEFAULT 0 CHECK (debit >= 0),
-  credit NUMERIC(18,2) NOT NULL DEFAULT 0 CHECK (credit >= 0),
-  CHECK ((debit > 0 AND credit = 0) OR (credit > 0 AND debit = 0))
-);
-
-CREATE TABLE gst_transactions (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  organization_id UUID NOT NULL REFERENCES organizations(id),
-  invoice_id UUID REFERENCES invoices(id),
-  direction TEXT NOT NULL CHECK (direction IN ('OUTPUT','INPUT')),
-  supply_category TEXT NOT NULL DEFAULT 'B2B',
-  taxable_value NUMERIC(18,2) NOT NULL DEFAULT 0,
-  cgst NUMERIC(18,2) NOT NULL DEFAULT 0,
-  sgst NUMERIC(18,2) NOT NULL DEFAULT 0,
-  igst NUMERIC(18,2) NOT NULL DEFAULT 0,
-  cess NUMERIC(18,2) NOT NULL DEFAULT 0,
-  itc_status TEXT,
-  reverse_charge BOOLEAN NOT NULL DEFAULT false,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE TABLE tds_transactions (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  organization_id UUID NOT NULL REFERENCES organizations(id),
-  party_id UUID REFERENCES parties(id),
-  transaction_date DATE NOT NULL,
-  section_code TEXT,
-  base_amount NUMERIC(18,2) NOT NULL,
-  rate NUMERIC(8,4) NOT NULL DEFAULT 0,
-  tds_amount NUMERIC(18,2) NOT NULL DEFAULT 0,
-  status TEXT NOT NULL DEFAULT 'PROPOSED'
-);
-
-CREATE TABLE compliance_items (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  organization_id UUID NOT NULL REFERENCES organizations(id),
-  compliance_type TEXT NOT NULL CHECK (compliance_type IN ('GSTR1','GSTR3B','TDS','ITR')),
-  period_start DATE NOT NULL,
-  period_end DATE NOT NULL,
-  status TEXT NOT NULL DEFAULT 'DRAFT',
-  payload JSONB,
-  acknowledgement JSONB,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE TABLE exceptions (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  organization_id UUID NOT NULL REFERENCES organizations(id),
-  severity TEXT NOT NULL CHECK (severity IN ('LOW','MEDIUM','HIGH','CRITICAL')),
-  category TEXT NOT NULL,
-  title TEXT NOT NULL,
-  description TEXT NOT NULL,
-  source_type TEXT,
-  source_id UUID,
-  status TEXT NOT NULL DEFAULT 'OPEN' CHECK (status IN ('OPEN','RESOLVED','IGNORED')),
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE TABLE audit_logs (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  organization_id UUID NOT NULL REFERENCES organizations(id),
-  actor_type TEXT NOT NULL,
-  action TEXT NOT NULL,
-  entity_type TEXT,
-  entity_id UUID,
-  before_data JSONB,
-  after_data JSONB,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE INDEX idx_journal_org_date ON journal_entries(organization_id, entry_date);
-CREATE INDEX idx_journal_lines_account ON journal_lines(account_id);
-CREATE INDEX idx_bank_org_date ON bank_transactions(organization_id, transaction_date);
-CREATE INDEX idx_gst_org ON gst_transactions(organization_id);
-CREATE INDEX idx_exceptions_org_status ON exceptions(organization_id, status);
+CREATE OR REPLACE FUNCTION prevent_posted_journal_line_change() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+ IF EXISTS(SELECT 1 FROM journal_entries WHERE id=OLD.journal_id AND status='POSTED') THEN RAISE EXCEPTION 'Posted journal lines are immutable'; END IF;
+ RETURN COALESCE(NEW,OLD);
+END $$;
+CREATE TRIGGER journal_line_immutability BEFORE UPDATE OR DELETE ON journal_lines FOR EACH ROW EXECUTE FUNCTION prevent_posted_journal_line_change();
