@@ -1,69 +1,11 @@
 import { Pool } from 'pg';
 import crypto from 'node:crypto';
-
-const n=(v:any)=>Number(v||0);
-const money=(v:number)=>Math.round((v+Number.EPSILON)*100)/100;
-
+const n=(v:any)=>Number(v||0); const money=(v:number)=>Math.round((v+Number.EPSILON)*100)/100;
 export type GstDoc={invoiceNumber:string;invoiceDate?:string;supplierGstin?:string;taxableValue:number;cgst:number;sgst:number;igst:number;cess:number;filingPeriod?:string};
-
-export function validateGstDocument(d:GstDoc){
- const errors:string[]=[];
- const tax=money(d.cgst+d.sgst+d.igst+d.cess);
- if(d.taxableValue<0) errors.push('Taxable value cannot be negative');
- if(d.cgst<0||d.sgst<0||d.igst<0||d.cess<0) errors.push('GST components cannot be negative');
- if(d.igst>0 && (d.cgst>0||d.sgst>0)) errors.push('IGST and CGST/SGST should not both be populated for the same tax component');
- if(d.supplierGstin && !/^\d{2}[A-Z0-9]{13}$/.test(d.supplierGstin)) errors.push('Supplier GSTIN format is invalid');
- return {valid:errors.length===0,errors,tax};
-}
-
-export function classifySupply(orgState:string|undefined,placeOfSupply:string|undefined,partyGstin:string|undefined){
- if(orgState && placeOfSupply && orgState===placeOfSupply) return 'INTRA_STATE';
- if(placeOfSupply) return 'INTER_STATE';
- if(partyGstin?.slice(0,2)===orgState) return 'INTRA_STATE';
- return 'UNKNOWN';
-}
-
-export async function importGstr2b(pool:Pool,org:string,records:GstDoc[]){
- let inserted=0,duplicates=0;
- for(const d of records){
-  const v=validateGstDocument(d); if(!v.valid) throw new Error(`Invalid GSTR-2B record ${d.invoiceNumber}: ${v.errors.join('; ')}`);
-  const hash=crypto.createHash('sha256').update(JSON.stringify([d.supplierGstin??'',d.invoiceNumber,d.invoiceDate??'',d.taxableValue,d.cgst,d.sgst,d.igst,d.cess,d.filingPeriod??''])).digest('hex');
-  const r=await pool.query(`INSERT INTO gst_2b_records(organization_id,supplier_gstin,invoice_number,invoice_date,filing_period,taxable_value,cgst,sgst,igst,cess,source_hash) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT(organization_id,source_hash) DO NOTHING RETURNING id`,[org,d.supplierGstin??null,d.invoiceNumber,d.invoiceDate??null,d.filingPeriod??null,d.taxableValue,d.cgst,d.sgst,d.igst,d.cess,hash]);
-  r.rowCount?inserted++:duplicates++;
- }
- return {inserted,duplicates,total:records.length};
-}
-
-export async function reconcileGstr2b(pool:Pool,org:string){
- await pool.query('DELETE FROM gst_reconciliations WHERE organization_id=$1',[org]);
- const books=await pool.query(`SELECT gt.*,i.invoice_number,i.invoice_date,p.gstin FROM gst_transactions gt JOIN invoices i ON i.id=gt.invoice_id LEFT JOIN parties p ON p.id=i.party_id WHERE gt.organization_id=$1 AND gt.direction='INPUT' ORDER BY i.invoice_date,i.invoice_number`,[org]);
- const two=await pool.query(`SELECT * FROM gst_2b_records WHERE organization_id=$1 ORDER BY invoice_date,invoice_number`,[org]);
- const used=new Set<string>();
- for(const b of books.rows){
-  const candidates=two.rows.filter(x=>!used.has(x.id) && (b.gstin?x.supplier_gstin===b.gstin:true) && String(x.invoice_number).trim().toUpperCase()===String(b.invoice_number).trim().toUpperCase());
-  if(!candidates.length){await pool.query(`INSERT INTO gst_reconciliations(organization_id,gst_transaction_id,match_status,confidence,difference) VALUES($1,$2,'MISSING_IN_2B',0,$3)`,[org,b.id,JSON.stringify({bookTaxable:n(b.taxable_value)})]);continue;}
-  const x=candidates[0];used.add(x.id);const diff={taxable:money(n(b.taxable_value)-n(x.taxable_value)),cgst:money(n(b.cgst)-n(x.cgst),),sgst:money(n(b.sgst)-n(x.sgst)),igst:money(n(b.igst)-n(x.igst)),cess:money(n(b.cess)-n(x.cess))};
-  const totalDiff=Math.abs(diff.taxable)+Math.abs(diff.cgst)+Math.abs(diff.sgst)+Math.abs(diff.igst)+Math.abs(diff.cess);const exact=totalDiff<0.01;
-  await pool.query(`INSERT INTO gst_reconciliations(organization_id,gst_transaction_id,gst_2b_record_id,match_status,confidence,difference) VALUES($1,$2,$3,$4,$5,$6)`,[org,b.id,x.id,exact?'MATCHED':'VALUE_MISMATCH',exact?1:0.65,JSON.stringify(diff)]);
- }
- for(const x of two.rows.filter(x=>!used.has(x.id))) await pool.query(`INSERT INTO gst_reconciliations(organization_id,gst_2b_record_id,match_status,confidence,difference) VALUES($1,$2,'MISSING_IN_BOOKS',0,$3)`,[org,x.id,JSON.stringify({invoiceNumber:x.invoice_number})]);
- const s=await pool.query(`SELECT match_status,count(*)::int count FROM gst_reconciliations WHERE organization_id=$1 GROUP BY match_status`,[org]);return s.rows;
-}
-
-export async function buildGstr1(pool:Pool,org:string,from:string,to:string){
- const r=await pool.query(`SELECT i.id,i.invoice_number,i.invoice_date,p.name party_name,p.gstin,p.state_code party_state,i.place_of_supply,i.reverse_charge,i.taxable_value,i.cgst,i.sgst,i.igst,i.cess,i.total FROM invoices i LEFT JOIN parties p ON p.id=i.party_id WHERE i.organization_id=$1 AND i.document_type='SALES' AND i.invoice_date BETWEEN $2 AND $3 AND i.status<>'VOID' ORDER BY i.invoice_date,i.invoice_number`,[org,from,to]);
- const docs=r.rows.map(x=>({invoiceNumber:x.invoice_number,invoiceDate:x.invoice_date,recipientGstin:x.gstin??null,placeOfSupply:x.place_of_supply??x.party_state??null,reverseCharge:x.reverse_charge,taxableValue:n(x.taxable_value),cgst:n(x.cgst),sgst:n(x.sgst),igst:n(x.igst),cess:n(x.cess),invoiceValue:n(x.total)}));
- const validation=docs.flatMap((x:any)=>{const e:string[]=[];if(!x.invoiceNumber)e.push('Missing invoice number');if(x.taxableValue<0)e.push('Negative taxable value');return e.map(v=>({invoiceNumber:x.invoiceNumber,error:v}))});
- return {returnType:'GSTR1',period:{from,to},documents:docs,summary:{invoiceCount:docs.length,taxableValue:money(docs.reduce((s:any,x:any)=>s+x.taxableValue,0)),cgst:money(docs.reduce((s:any,x:any)=>s+x.cgst,0)),sgst:money(docs.reduce((s:any,x:any)=>s+x.sgst,0)),igst:money(docs.reduce((s:any,x:any)=>s+x.igst,0)),cess:money(docs.reduce((s:any,x:any)=>s+x.cess,0))},validation};
-}
-
-export async function buildGstr3b(pool:Pool,org:string,from:string,to:string){
- const r=await pool.query(`SELECT direction,COALESCE(SUM(taxable_value),0) taxable,COALESCE(SUM(cgst),0) cgst,COALESCE(SUM(sgst),0) sgst,COALESCE(SUM(igst),0) igst,COALESCE(SUM(cess),0) cess FROM gst_transactions WHERE organization_id=$1 AND created_at::date BETWEEN $2 AND $3 GROUP BY direction`,[org,from,to]);
- const o=r.rows.find(x=>x.direction==='OUTPUT')??{};const i=r.rows.find(x=>x.direction==='INPUT')??{};const output={taxable:n(o.taxable),cgst:n(o.cgst),sgst:n(o.sgst),igst:n(o.igst),cess:n(o.cess)};const input={taxable:n(i.taxable),cgst:n(i.cgst),sgst:n(i.sgst),igst:n(i.igst),cess:n(i.cess)};const outputTax=output.cgst+output.sgst+output.igst+output.cess;const itc=input.cgst+input.sgst+input.igst+input.cess;return {returnType:'GSTR3B',period:{from,to},outward:output,itc:input,outputTax:money(outputTax),eligibleItc:money(itc),netTaxBeforeOtherAdjustments:money(Math.max(0,outputTax-itc)),warning:itc>outputTax?'ITC exceeds output tax; carry-forward/refund treatment requires applicable rules and review.':null};
-}
-
-export async function buildTds(pool:Pool,org:string,from:string,to:string){
- const r=await pool.query(`SELECT t.id,t.transaction_date,t.section_code,p.pan,p.name,t.base_amount,t.rate,t.tds_amount,t.status FROM tds_transactions t LEFT JOIN parties p ON p.id=t.party_id WHERE t.organization_id=$1 AND t.transaction_date BETWEEN $2 AND $3 ORDER BY t.transaction_date,t.id`,[org,from,to]);
- const records=r.rows.map(x=>({...x,baseAmount:n(x.base_amount),rate:n(x.rate),tdsAmount:n(x.tds_amount)}));
- return {returnType:'TDS',period:{from,to},records,totalBaseAmount:money(records.reduce((s:any,x:any)=>s+x.baseAmount,0)),totalTds:money(records.reduce((s:any,x:any)=>s+x.tdsAmount,0)),validation:records.filter(x=>!x.section_code||!x.pan).map(x=>({id:x.id,error:!x.section_code?'Missing section code':'Missing PAN'}))};
-}
+export function validateGstDocument(d:GstDoc){const errors:string[]=[];const tax=money(d.cgst+d.sgst+d.igst+d.cess);if(d.taxableValue<0)errors.push('Taxable value cannot be negative');if(d.cgst<0||d.sgst<0||d.igst<0||d.cess<0)errors.push('GST components cannot be negative');if(d.igst>0&&(d.cgst>0||d.sgst>0))errors.push('IGST and CGST/SGST should not both be populated for the same tax component');if(d.supplierGstin&&!/^\d{2}[A-Z0-9]{13}$/.test(d.supplierGstin))errors.push('Supplier GSTIN format is invalid');return{valid:errors.length===0,errors,tax};}
+export function classifySupply(orgState:string|undefined,placeOfSupply:string|undefined,partyGstin:string|undefined){if(orgState&&placeOfSupply&&orgState===placeOfSupply)return'INTRA_STATE';if(placeOfSupply)return'INTER_STATE';if(partyGstin?.slice(0,2)===orgState)return'INTRA_STATE';return'UNKNOWN';}
+export async function importGstr2b(pool:Pool,org:string,records:GstDoc[]){let inserted=0,duplicates=0;for(const d of records){const v=validateGstDocument(d);if(!v.valid)throw new Error(`Invalid GSTR-2B record ${d.invoiceNumber}: ${v.errors.join('; ')}`);const hash=crypto.createHash('sha256').update(JSON.stringify([d.supplierGstin??'',d.invoiceNumber,d.invoiceDate??'',d.taxableValue,d.cgst,d.sgst,d.igst,d.cess,d.filingPeriod??''])).digest('hex');const r=await pool.query(`INSERT INTO gst_2b_records(organization_id,supplier_gstin,invoice_number,invoice_date,filing_period,taxable_value,cgst,sgst,igst,cess,source_hash) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT(organization_id,source_hash) DO NOTHING RETURNING id`,[org,d.supplierGstin??null,d.invoiceNumber,d.invoiceDate??null,d.filingPeriod??null,d.taxableValue,d.cgst,d.sgst,d.igst,d.cess,hash]);r.rowCount?inserted++:duplicates++;}return{inserted,duplicates,total:records.length};}
+export async function reconcileGstr2b(pool:Pool,org:string){await pool.query('DELETE FROM gst_reconciliations WHERE organization_id=$1',[org]);const books=await pool.query(`SELECT gt.*,i.invoice_number,i.invoice_date,p.gstin FROM gst_transactions gt JOIN invoices i ON i.id=gt.invoice_id LEFT JOIN parties p ON p.id=i.party_id WHERE gt.organization_id=$1 AND gt.direction='INPUT' ORDER BY i.invoice_date,i.invoice_number`,[org]);const two=await pool.query(`SELECT * FROM gst_2b_records WHERE organization_id=$1 ORDER BY invoice_date,invoice_number`,[org]);const used=new Set<string>();for(const b of books.rows){const candidates=two.rows.filter(x=>!used.has(x.id)&&(b.gstin?x.supplier_gstin===b.gstin:true)&&String(x.invoice_number).trim().toUpperCase()===String(b.invoice_number).trim().toUpperCase());if(!candidates.length){await pool.query(`INSERT INTO gst_reconciliations(organization_id,gst_transaction_id,match_status,confidence,difference) VALUES($1,$2,'MISSING_IN_2B',0,$3)`,[org,b.id,JSON.stringify({bookTaxable:n(b.taxable_value)})]);continue;}const x=candidates[0];used.add(x.id);const diff={taxable:money(n(b.taxable_value)-n(x.taxable_value)),cgst:money(n(b.cgst)-n(x.cgst)),sgst:money(n(b.sgst)-n(x.sgst)),igst:money(n(b.igst)-n(x.igst)),cess:money(n(b.cess)-n(x.cess))};const totalDiff=Math.abs(diff.taxable)+Math.abs(diff.cgst)+Math.abs(diff.sgst)+Math.abs(diff.igst)+Math.abs(diff.cess);const exact=totalDiff<0.01;await pool.query(`INSERT INTO gst_reconciliations(organization_id,gst_transaction_id,gst_2b_record_id,match_status,confidence,difference) VALUES($1,$2,$3,$4,$5,$6)`,[org,b.id,x.id,exact?'MATCHED':'VALUE_MISMATCH',exact?1:0.65,JSON.stringify(diff)]);}for(const x of two.rows.filter(x=>!used.has(x.id)))await pool.query(`INSERT INTO gst_reconciliations(organization_id,gst_2b_record_id,match_status,confidence,difference) VALUES($1,$2,'MISSING_IN_BOOKS',0,$3)`,[org,x.id,JSON.stringify({invoiceNumber:x.invoice_number})]);return(await pool.query(`SELECT match_status,count(*)::int count FROM gst_reconciliations WHERE organization_id=$1 GROUP BY match_status`,[org])).rows;}
+export async function buildGstr1(pool:Pool,org:string,from:string,to:string){const r=await pool.query(`SELECT i.invoice_number,i.invoice_date,p.gstin,p.state_code party_state,i.place_of_supply,i.reverse_charge,i.taxable_value,i.cgst,i.sgst,i.igst,i.cess,i.total FROM invoices i LEFT JOIN parties p ON p.id=i.party_id WHERE i.organization_id=$1 AND i.document_type='SALES' AND i.invoice_date BETWEEN $2 AND $3 AND i.status<>'VOID' ORDER BY i.invoice_date,i.invoice_number`,[org,from,to]);const documents=r.rows.map(x=>({invoiceNumber:x.invoice_number,invoiceDate:x.invoice_date,recipientGstin:x.gstin??null,placeOfSupply:x.place_of_supply??x.party_state??null,reverseCharge:x.reverse_charge,taxableValue:n(x.taxable_value),cgst:n(x.cgst),sgst:n(x.sgst),igst:n(x.igst),cess:n(x.cess),invoiceValue:n(x.total)}));return{returnType:'GSTR1',period:{from,to},documents,summary:{invoiceCount:documents.length,taxableValue:money(documents.reduce((s,x)=>s+x.taxableValue,0)),cgst:money(documents.reduce((s,x)=>s+x.cgst,0)),sgst:money(documents.reduce((s,x)=>s+x.sgst,0)),igst:money(documents.reduce((s,x)=>s+x.igst,0)),cess:money(documents.reduce((s,x)=>s+x.cess,0))},validation:documents.flatMap(x=>{const e:string[]=[];if(!x.invoiceNumber)e.push('Missing invoice number');if(x.taxableValue<0)e.push('Negative taxable value');return e.map(error=>({invoiceNumber:x.invoiceNumber,error}));})};}
+export async function buildGstr3b(pool:Pool,org:string,from:string,to:string){const r=await pool.query(`SELECT direction,COALESCE(SUM(taxable_value),0) taxable,COALESCE(SUM(cgst),0) cgst,COALESCE(SUM(sgst),0) sgst,COALESCE(SUM(igst),0) igst,COALESCE(SUM(cess),0) cess FROM gst_transactions WHERE organization_id=$1 AND created_at::date BETWEEN $2 AND $3 GROUP BY direction`,[org,from,to]);const o=r.rows.find(x=>x.direction==='OUTPUT')??{};const i=r.rows.find(x=>x.direction==='INPUT')??{};const outward={taxable:n(o.taxable),cgst:n(o.cgst),sgst:n(o.sgst),igst:n(o.igst),cess:n(o.cess)};const itc={taxable:n(i.taxable),cgst:n(i.cgst),sgst:n(i.sgst),igst:n(i.igst),cess:n(i.cess)};const outputTax=outward.cgst+outward.sgst+outward.igst+outward.cess;const eligibleItc=itc.cgst+itc.sgst+itc.igst+itc.cess;return{returnType:'GSTR3B',period:{from,to},outward,itc,outputTax:money(outputTax),eligibleItc:money(eligibleItc),netTaxBeforeOtherAdjustments:money(Math.max(0,outputTax-eligibleItc)),warning:eligibleItc>outputTax?'ITC exceeds output tax; applicable carry-forward/refund treatment requires review.':null};}
+export async function buildTds(pool:Pool,org:string,from:string,to:string){const r=await pool.query(`SELECT t.id,t.transaction_date,t.section_code,p.pan,p.name,t.base_amount,t.rate,t.tds_amount,t.status FROM tds_transactions t LEFT JOIN parties p ON p.id=t.party_id WHERE t.organization_id=$1 AND t.transaction_date BETWEEN $2 AND $3 ORDER BY t.transaction_date,t.id`,[org,from,to]);const records=r.rows.map(x=>({...x,baseAmount:n(x.base_amount),rate:n(x.rate),tdsAmount:n(x.tds_amount)}));return{returnType:'TDS',period:{from,to},records,totalBaseAmount:money(records.reduce((s,x)=>s+x.baseAmount,0)),totalTds:money(records.reduce((s,x)=>s+x.tdsAmount,0)),validation:records.filter(x=>!x.section_code||!x.pan).map(x=>({id:x.id,error:!x.section_code?'Missing section code':'Missing PAN'}))};}
