@@ -1,6 +1,5 @@
 import express from 'express';
 import { Pool } from 'pg';
-import { z } from 'zod';
 import { saasRoutes, authRequired } from './saas.js';
 import { productionRoutes } from './production-routes.js';
 import { part2Routes } from './part2-routes.js';
@@ -18,10 +17,11 @@ app.use('/api/saas',saasRoutes(pool));
 app.use('/api/app',productionRoutes(pool));
 
 const tenantRouter=(factory:(pool:Pool,org:string)=>express.Router())=>[authRequired(pool),(req:express.Request,res:express.Response,next:express.NextFunction)=>factory(pool,req.auth!.organizationId)(req,res,next)];
-app.use('/api/app/accounting',...tenantRouter((p,o)=>part2Routes(p,o)));
-app.use('/api/app/gst',...tenantRouter((p,o)=>part3Routes(p,o)));
-app.use('/api/app/itr',...tenantRouter((p,o)=>part4Routes(p,o)));
-app.use('/api/app/compliance',authRequired(pool),part5Routes());
+// Existing domain routers retain their canonical paths under /api/app.
+app.use('/api/app',...tenantRouter((p,o)=>part2Routes(p,o)));
+app.use('/api/app',...tenantRouter((p,o)=>part3Routes(p,o)));
+app.use('/api/app',...tenantRouter((p,o)=>part4Routes(p,o)));
+app.use('/api/app',authRequired(pool),part5Routes());
 
 app.get('/',(_req,res)=>res.sendFile('app.html',{root:'public'}));
 app.use(express.static('public'));
