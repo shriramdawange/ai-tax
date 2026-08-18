@@ -3,8 +3,9 @@ import { Pool } from 'pg';
 import { z } from 'zod';
 import { postJournal, trialBalance, financialSummary } from './accounting.js';
 import { complianceSummary } from './compliance.js';
+import { part2Routes } from './part2-routes.js';
 
-const app=express(); app.use(express.json({limit:'2mb'}));
+const app=express(); app.use(express.json({limit:'5mb'}));
 const pool=new Pool({connectionString:process.env.DATABASE_URL??'postgres://ai_tax:ai_tax_dev@localhost:5432/ai_tax'});
 const ORG='00000000-0000-0000-0000-000000000001'; const PERIOD='00000000-0000-0000-0000-000000000101';
 const money=z.number().finite().nonnegative();
@@ -24,4 +25,5 @@ app.get('/api/invoices',async(_req,res)=>res.json((await pool.query(`SELECT i.*,
 app.get('/api/invoices/:id',async(req,res)=>{const i=await pool.query('SELECT i.*,p.name party_name,p.gstin party_gstin FROM invoices i LEFT JOIN parties p ON p.id=i.party_id WHERE i.id=$1 AND i.organization_id=$2',[req.params.id,ORG]);if(!i.rowCount)return res.status(404).json({error:'Invoice not found'});const items=await pool.query('SELECT * FROM invoice_items WHERE invoice_id=$1 ORDER BY id',[req.params.id]);res.json({invoice:i.rows[0],items:items.rows})});
 app.get('/api/ledger/:accountId',async(req,res)=>{const r=await pool.query(`SELECT je.entry_date,je.voucher_number,je.voucher_type,je.narration,jl.description,jl.debit,jl.credit FROM journal_lines jl JOIN journal_entries je ON je.id=jl.journal_id WHERE je.organization_id=$1 AND jl.account_id=$2 AND je.status='POSTED' ORDER BY je.entry_date,je.created_at`,[ORG,req.params.accountId]);let b=0;res.json(r.rows.map(x=>{b+=Number(x.debit)-Number(x.credit);return {...x,balance:b.toFixed(2)}}))});
 app.get('/api/reports/summary',async(_req,res)=>res.json(await financialSummary(pool,ORG)));app.get('/api/reports/trial-balance',async(_req,res)=>res.json(await trialBalance(pool,ORG)));app.get('/api/compliance/summary',async(_req,res)=>res.json(await complianceSummary(pool,ORG)));
+app.use('/api/part2',part2Routes(pool,ORG));
 app.get('/',(_req,res)=>res.sendFile('index.html',{root:'public'}));app.use(express.static('public'));const port=Number(process.env.PORT??3000);app.listen(port,()=>console.log(`AI TAX running on http://localhost:${port}`));
