@@ -9,6 +9,7 @@
     "dev:legacy": "tsx src/server.ts",
     "start": "node dist/src/production-server.js",
     "start:legacy": "node dist/src/server.js",
+    "db:migrate": "node scripts/migrate.mjs",
     "build": "tsc",
     "test": "tsx --test test/**/*.test.ts"
   },
