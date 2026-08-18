@@ -1,84 +1,64 @@
 # AI TAX
 
-AI-first Indian accounting, GST, TDS and ITR compliance platform.
+Autonomous Indian accounting, GST, TDS and ITR compliance platform.
 
-## What works now
+## Part 1 — Financial Core
 
-- Dockerized PostgreSQL development environment
-- Multi-tenant-ready organization model
-- Financial periods
+The first full-stack milestone is now implemented in the repository:
+
+- PostgreSQL financial data model
+- Demo organization and FY 2026-27 seed data
 - Chart of accounts
-- Parties/customers/vendors
-- Invoices and GST transaction model
-- Deterministic double-entry journal engine
-- Journal balancing invariant
-- Ledger endpoint with running balances
+- Customers/vendors
+- Sales/purchase invoice records with line items
+- Double-entry journal engine
+- Exact paise-level balance validation
+- Financial-period locking checks
+- Posted-journal immutability
+- Ledger endpoint with running balance
 - Trial balance
-- Revenue/expense reporting
-- GST preparation endpoints for GSTR-1 and GSTR-3B datasets
-- TDS preparation endpoint
-- Compliance summary
-- Audit log foundation
+- Profit & loss calculation
+- Balance-sheet summary
+- GST/TDS preparation summary
+- Audit log records
 - Functional browser dashboard
-- Automated accounting unit tests
+- Journal posting UI
+- Invoice creation UI
+- Financial reports UI
+- Compliance status UI
+- TypeScript tests and GitHub Actions CI
 
-## Start locally
+## Run locally
 
-Requirements: Docker + Docker Compose.
+Requirements: Docker Desktop.
 
 ```bash
+git clone https://github.com/shriramdawange/ai-tax.git
+cd ai-tax
 docker compose up --build
 ```
 
 Open `http://localhost:3000`.
 
-The database is seeded with a demo business, chart of accounts, customer/vendor, invoice, GST transaction, TDS transaction and balanced accounting entries.
-
-To reset the demo database:
+To reset the demo database after schema changes:
 
 ```bash
 docker compose down -v
 docker compose up --build
 ```
 
-## API examples
+## Architecture rule
 
-Health:
+AI interprets unstructured financial information and proposes actions. Deterministic domain engines calculate and persist accounting/tax values. Government filing is isolated behind official integration adapters and authorization gates. The application never fabricates a filing acknowledgement.
 
-`GET /api/health`
+## Five-part build plan
 
-Dashboard:
+1. **Financial core** — accounting, invoices, ledger, reports, auditability. **Current.**
+2. **Document + banking automation** — OCR, invoice intelligence, bank imports, BRS and matching.
+3. **GST + TDS engines** — versioned rules, reconciliation, GSTR-1/GSTR-3B and TDS preparation.
+4. **ITR + AI Accountant** — tax computation, tax-data reconciliation and controlled AI agents.
+5. **Government integrations + production hardening** — official GSP/ERI adapters, authorization, filing status, security, observability and deployment.
 
-`GET /api/dashboard`
+## Important
 
-Trial balance is included in the dashboard response.
-
-Prepare GSTR-1 dataset:
-
-`POST /api/compliance/gstr1/prepare`
-
-```json
-{"from":"2026-08-01","to":"2026-08-31"}
-```
-
-Prepare GSTR-3B dataset:
-
-`POST /api/compliance/gstr3b/prepare`
-
-Prepare TDS dataset:
-
-`POST /api/compliance/tds/prepare`
-
-## Architecture principles
-
-- AI interprets; deterministic engines calculate.
-- Money uses PostgreSQL NUMERIC rather than floating point.
-- Every financial/tax number must be traceable to source records.
-- Posted journals are immutable; corrections use reversal/adjustment workflows.
-- Government filing is isolated behind replaceable official integration adapters.
-- The application never fabricates government responses or filing status.
-- Sensitive filing actions require the authorization required by the official mechanism.
-
-## Current status
-
-The repository now contains a runnable Phase-1 vertical slice. The remaining production work is the document/OCR pipeline, real bank import/reconciliation, versioned GST/TDS/ITR rule libraries, authentication/tenant enforcement, AI provider integration, and official government filing adapters. Those integrations must use the current authorized government/GSP/ERI mechanisms and real credentials; they cannot be safely or honestly mocked as production filing.
+This is an actively developed compliance product, not a claim that government filing is already enabled. Actual filing requires the relevant official integration access, credentials and taxpayer authorization.
