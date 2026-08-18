@@ -11,6 +11,7 @@ services:
       - ai_tax_pg:/var/lib/postgresql/data
       - ./db/schema.sql:/docker-entrypoint-initdb.d/001-schema.sql:ro
       - ./db/seed.sql:/docker-entrypoint-initdb.d/002-seed.sql:ro
+      - ./db/003-part2.sql:/docker-entrypoint-initdb.d/003-part2.sql:ro
   app:
     image: node:22-alpine
     working_dir: /app
